@@ -13,12 +13,20 @@
 #
 # This script:
 #   1) maps titles/author names -> internal IDs
-#   2) builds a pseudo-user embedding from description embeddings of liked/disliked books
+#   2) builds a pseudo-user embedding from:
+#        - liked/disliked books
+#        - liked genres (avg over books with those genres)
+#        - liked authors (avg over books by those authors)
 #   3) scores items by cosine similarity
 #   4) returns:
 #        {
-#          "raw":      [book_dict, ...],   # top candidates (excluding liked/disliked families only)
-#          "filtered": [book_dict, ...],   # after genre/author/excluded-title filtering with replacement
+#          "raw":             [book_dict, ...],   # top candidates
+#          "filtered":        [book_dict, ...],   # after genre/author/excluded filtering
+#          "unmatched_titles":{
+#              "liked_books":    [...],
+#              "disliked_books": [...],
+#              "excluded_books": [...]
+#          }
 #        }
 
 from __future__ import annotations
@@ -53,19 +61,7 @@ def normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def canonical_main_title(title: str) -> str:
     """
-    Canonicalize a title to a coarse "main title" for de-duplication:
-
-      - lowercase
-      - strip punctuation → spaces
-      - collapse whitespace
-      - drop stopwords: 'the', 'a', 'an', 'of'
-      - return the FIRST non-stopword token as key
-
-    So:
-      "The Hobbit"
-      "The Hobbit, or There and Back Again"
-      "The Hobbit: Graphic Novel"
-      → all map to "hobbit"
+    Canonicalize a title to a coarse "main title" for de-duplication and fuzzy lookup.
     """
     t = str(title).lower()
     t = re.sub(r"[^a-z0-9\s]", " ", t)
@@ -83,12 +79,6 @@ def canonical_main_title(title: str) -> str:
 def parse_authors_value(val) -> List[int]:
     """
     Parse the 'authors' value into a list of integer author IDs.
-
-    Handles:
-      - list/tuple/ndarray of ints/strings/dicts
-      - dicts with keys like 'author_id' or 'id'
-      - stringified lists/dicts via ast.literal_eval
-      - single id as int/str
     """
 
     # If it's a string, try to literal_eval it first
@@ -103,16 +93,13 @@ def parse_authors_value(val) -> List[int]:
             val = s  # leave as raw string
 
     def extract_id(obj) -> Optional[int]:
-        # int-like
         if isinstance(obj, (int, np.integer)):
             return int(obj)
-        # string that might be an int
         if isinstance(obj, str):
             try:
                 return int(obj)
             except Exception:
                 return None
-        # dict containing id
         if isinstance(obj, dict):
             for key in ["author_id", "id"]:
                 if key in obj:
@@ -122,7 +109,6 @@ def parse_authors_value(val) -> List[int]:
                         return None
         return None
 
-    # list-like
     if isinstance(val, (list, tuple, set, np.ndarray)):
         ids: List[int] = []
         for item in val:
@@ -131,7 +117,6 @@ def parse_authors_value(val) -> List[int]:
                 ids.append(aid)
         return ids
 
-    # single object
     aid = extract_id(val)
     return [aid] if aid is not None else []
 
@@ -139,10 +124,6 @@ def parse_authors_value(val) -> List[int]:
 def load_authors_mapping() -> Dict[int, str]:
     """
     Load authors.parquet (if present) and build a mapping author_id -> author_name.
-
-    We try:
-      id_col in ['author_id', 'id']
-      name_col in ['name', 'author_name']
     """
     if not AUTHORS_PATH.exists():
         print(f"[warn] {AUTHORS_PATH} not found; author filters will only use raw 'authors' text.")
@@ -224,6 +205,7 @@ class DescEmbeddingTeacher:
                 s = v.strip()
                 if not s:
                     return []
+            # Try to parse list-like string
                 try:
                     parsed = ast.literal_eval(s)
                     if isinstance(parsed, (list, tuple, set, np.ndarray)):
@@ -293,13 +275,61 @@ class DescEmbeddingTeacher:
             total_names = int(self.df_books["author_names"].apply(len).sum())
             print(f"[authors] filled author_names from books['authors'] text, total names={total_names}")
 
-        print("[init] Teacher initialized with titles, genres, authors, and embeddings.")
+        # ---- Precompute genre -> indices and author_name -> indices for liked_genres/authors embedding ----
+        self.genre_to_indices: Dict[str, List[int]] = {}
+        for idx, glist in enumerate(self.df_books["genres"]):
+            for g in glist:
+                key = str(g).strip().lower()
+                if not key:
+                    continue
+                self.genre_to_indices.setdefault(key, []).append(idx)
+
+        self.author_to_indices: Dict[str, List[int]] = {}
+        for idx, names in enumerate(self.df_books["author_names"]):
+            for n in names:
+                key = str(n).strip().lower()
+                if not key:
+                    continue
+                self.author_to_indices.setdefault(key, []).append(idx)
+
+        print(
+            f"[init] Teacher initialized with titles, genres, authors, embeddings "
+            f"(genres={len(self.genre_to_indices)}, authors={len(self.author_to_indices)})"
+        )
 
     # --------- lookup / aggregation helpers ---------
 
     def _find_title_indices(self, title: str) -> List[int]:
+        """
+        Robust lookup for title → indices:
+
+        1) exact match on title_norm
+        2) if none, match on canonical main_title
+        3) if still none, substring search on title_norm
+        """
         key = title.strip().lower()
-        return self.title_to_idxs.get(key, [])
+        if not key:
+            return []
+
+        # 1) exact title_norm
+        if key in self.title_to_idxs:
+            return self.title_to_idxs[key]
+
+        # 2) canonical main_title match
+        mt = canonical_main_title(title)
+        if mt:
+            mask = self.df_books["main_title"] == mt
+            idxs = np.where(mask.to_numpy(bool))[0]
+            if len(idxs) > 0:
+                return idxs.tolist()
+
+        # 3) substring search in title_norm
+        mask = self.df_books["title_norm"].str.contains(key, na=False)
+        idxs = np.where(mask.to_numpy(bool))[0]
+        if len(idxs) > 0:
+            return idxs.tolist()
+
+        return []
 
     def _expand_indices_and_weights(
         self,
@@ -326,20 +356,16 @@ class DescEmbeddingTeacher:
                 print(f"[warn] title from query not found in corpus: '{title}'")
                 continue
 
-            # Expand indices & weights
             all_indices.extend(idxs)
             all_weights.extend([rating] * len(idxs))
 
-            # Track main_title for family-level filtering
             mt = canonical_main_title(title)
             if mt:
                 main_titles.add(mt)
 
-        # Deduplicate indices but preserve sum of weights for duplicates
         if not all_indices:
             return [], [], main_titles
 
-        # Aggregate weights per index
         weight_map: Dict[int, float] = {}
         for idx, w in zip(all_indices, all_weights):
             weight_map[idx] = weight_map.get(idx, 0.0) + w
@@ -356,8 +382,6 @@ class DescEmbeddingTeacher:
         Resolve books (by 'title') to:
           - indices in df_books
           - set of main_title keys for family-level exclusion.
-
-        Used for excluded_books: they don't affect embedding, just filtering.
         """
         indices: List[int] = []
         main_titles: Set[str] = set()
@@ -382,56 +406,109 @@ class DescEmbeddingTeacher:
         self,
         liked_books: List[Dict[str, Any]],
         disliked_books: List[Dict[str, Any]],
+        liked_genres: List[str],
+        liked_authors: List[str],
         alpha: float = 1.0,
     ) -> Tuple[Optional[np.ndarray], List[int], List[int], Set[str], Set[str]]:
         """
-        Build user embedding:
+        Build user embedding from multiple signals:
 
-          u_raw = weighted_mean(liked_embs) - alpha * weighted_mean(disliked_embs)
-          u = normalize(u_raw)
-
-        Weights come from the 'rating' field provided by the planner.
-
-        Returns:
-          user_vec,
-          liked_indices,
-          disliked_indices,
-          liked_main_titles_set,
-          disliked_main_titles_set
+          - liked_books (with ratings)
+          - disliked_books (with ratings)
+          - liked_genres: average of embeddings of all books having those genres
+          - liked_authors: average of embeddings of all books by those authors
         """
         liked_idx, liked_w, liked_mts = self._expand_indices_and_weights(liked_books)
         disliked_idx, disliked_w, disliked_mts = self._expand_indices_and_weights(disliked_books)
 
-        if not liked_idx and not disliked_idx:
-            print("[warn] No liked or disliked books matched; cannot build user embedding.")
+        has_any_signal = (
+            bool(liked_idx)
+            or bool(disliked_idx)
+            or bool(liked_genres)
+            or bool(liked_authors)
+        )
+        if not has_any_signal:
+            print("[warn] No liked/disliked books, genres, or authors matched; cannot build user embedding.")
             return None, [], [], liked_mts, disliked_mts
 
         def weighted_mean(indices: List[int], weights: List[float]) -> Optional[np.ndarray]:
             if not indices:
                 return None
-            embs = self.item_embs_norm[indices]  # (n, d)
+            embs = self.item_embs_norm[indices]
             w = np.asarray(weights, dtype=np.float32)
             if w.sum() <= 0:
                 return embs.mean(axis=0)
             w = w / w.sum()
             return (w[:, None] * embs).sum(axis=0)
 
-        like_vec = weighted_mean(liked_idx, liked_w)
+        # book-based like/dislike
+        like_vec_books = weighted_mean(liked_idx, liked_w)
         dislike_vec = weighted_mean(disliked_idx, disliked_w)
+
+        # liked_genres → average of books containing any liked genre
+        genre_indices_set: Set[int] = set()
+        for g in liked_genres:
+            key = str(g).strip().lower()
+            if not key:
+                continue
+            idxs = self.genre_to_indices.get(key, [])
+            for idx in idxs:
+                genre_indices_set.add(idx)
+        like_vec_genres: Optional[np.ndarray] = None
+        if genre_indices_set:
+            genre_indices = sorted(genre_indices_set)
+            embs = self.item_embs_norm[genre_indices]
+            like_vec_genres = embs.mean(axis=0)
+            print(f"[user] liked_genres contributed from {len(genre_indices)} book embeddings.")
+
+        # liked_authors → average of books written by those authors
+        author_indices_set: Set[int] = set()
+        for a in liked_authors:
+            key = str(a).strip().lower()
+            if not key:
+                continue
+            idxs = self.author_to_indices.get(key, [])
+            for idx in idxs:
+                author_indices_set.add(idx)
+        like_vec_authors: Optional[np.ndarray] = None
+        if author_indices_set:
+            author_indices = sorted(author_indices_set)
+            embs = self.item_embs_norm[author_indices]
+            like_vec_authors = embs.mean(axis=0)
+            print(f"[user] liked_authors contributed from {len(author_indices)} book embeddings.")
+
+        # combine positive signals
+        positive_components: List[np.ndarray] = []
+        if like_vec_books is not None:
+            positive_components.append(like_vec_books)
+        if like_vec_genres is not None:
+            positive_components.append(like_vec_genres)
+        if like_vec_authors is not None:
+            positive_components.append(like_vec_authors)
+
+        if not positive_components and dislike_vec is None:
+            print("[warn] Only negative preferences could be inferred; using dislike_vec only.")
+
+        if positive_components:
+            like_vec = np.mean(np.stack(positive_components, axis=0), axis=0)
+        else:
+            like_vec = None
 
         if like_vec is None and dislike_vec is not None:
             u_raw = -alpha * dislike_vec
         elif like_vec is not None and dislike_vec is None:
             u_raw = like_vec
         else:
-            u_raw = like_vec - alpha * dislike_vec  # liked – alpha * disliked
+            u_raw = like_vec - alpha * dislike_vec
 
         u_raw = u_raw.reshape(1, -1)
         u = normalize_rows(u_raw)[0]
         print(
             f"[user] built user embedding from query: "
-            f"{len(liked_idx)} liked idx (|liked_books|={len(liked_books)}), "
-            f"{len(disliked_idx)} disliked idx (|disliked_books|={len(disliked_books)}), "
+            f"{len(liked_idx)} liked-book idx (|liked_books|={len(liked_books)}), "
+            f"{len(disliked_idx)} disliked-book idx (|disliked_books|={len(disliked_books)}), "
+            f"{len(genre_indices_set)} genre-based idx (|liked_genres|={len(liked_genres)}), "
+            f"{len(author_indices_set)} author-based idx (|liked_authors|={len(liked_authors)}), "
             f"alpha={alpha}"
         )
         return u, liked_idx, disliked_idx, liked_mts, disliked_mts
@@ -459,9 +536,6 @@ class DescEmbeddingTeacher:
         return mask
 
     def _build_disliked_author_mask(self, disliked_authors: Iterable[str]) -> np.ndarray:
-        """
-        disliked_authors: iterable of author NAMES (strings).
-        """
         if not disliked_authors:
             return np.zeros(len(self.df_books), dtype=bool)
 
@@ -477,6 +551,23 @@ class DescEmbeddingTeacher:
 
         mask = self.df_books["author_names"].apply(has_disliked_author).to_numpy(dtype=bool)
         return mask
+
+    # --------- unmatched titles helper for responder ---------
+
+    def _collect_unmatched_titles(self, books: List[Dict[str, Any]]) -> List[str]:
+        """
+        Return titles from 'books' that could not be resolved to any index,
+        using the same robust _find_title_indices logic.
+        """
+        unmatched: List[str] = []
+        for b in books:
+            title = str(b.get("title", "")).strip()
+            if not title:
+                continue
+            idxs = self._find_title_indices(title)
+            if not idxs:
+                unmatched.append(title)
+        return unmatched
 
     # --------- public: title search helper ---------
 
@@ -502,14 +593,14 @@ class DescEmbeddingTeacher:
         top_raw: int = 50,
         top_filtered: int = 20,
         alpha: float = 1.0,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> Dict[str, Any]:
         """
         query dict structure:
 
         {
           "liked_books":     [{"title": str, "rating": float}, ...],
           "disliked_books":  [{"title": str, "rating": float}, ...],
-          "excluded_books":  [{"title": str}, ...],      # hard exclusion, no effect on embedding
+          "excluded_books":  [{"title": str}, ...],
           "liked_genres":    [str, ...],
           "disliked_genres": [str, ...],
           "liked_authors":   [str, ...],
@@ -518,8 +609,13 @@ class DescEmbeddingTeacher:
 
         Returns:
           {
-            "raw":      [book_dict, ...],  # top_raw (no excluded filter here)
-            "filtered": [book_dict, ...],  # after genre/author/excluded filters, up to top_filtered
+            "raw":      [book_dict, ...],
+            "filtered": [book_dict, ...],
+            "unmatched_titles": {
+                "liked_books":    [...],
+                "disliked_books": [...],
+                "excluded_books": [...]
+            }
           }
         """
         liked_books = query.get("liked_books", []) or []
@@ -531,24 +627,40 @@ class DescEmbeddingTeacher:
         liked_authors = query.get("liked_authors", []) or []
         disliked_authors = query.get("disliked_authors", []) or []
 
-        # Build user embedding from positive/negative examples
+        # Build user embedding
         user_vec, liked_idx, disliked_idx, liked_mts, disliked_mts = self._build_user_embedding_from_query(
             liked_books=liked_books,
             disliked_books=disliked_books,
+            liked_genres=liked_genres,
+            liked_authors=liked_authors,
             alpha=alpha,
         )
         if user_vec is None:
-            return {"raw": [], "filtered": []}
+            return {
+                "raw": [],
+                "filtered": [],
+                "unmatched_titles": {
+                    "liked_books": self._collect_unmatched_titles(liked_books),
+                    "disliked_books": self._collect_unmatched_titles(disliked_books),
+                    "excluded_books": self._collect_unmatched_titles(excluded_books),
+                },
+            }
 
-        # Excluded books: indices + main_title families (for *filtering* only)
+        # Collect unmatched titles for responder
+        unmatched_titles = {
+            "liked_books": self._collect_unmatched_titles(liked_books),
+            "disliked_books": self._collect_unmatched_titles(disliked_books),
+            "excluded_books": self._collect_unmatched_titles(excluded_books),
+        }
+
+        # Excluded books (for filtering only)
         excluded_idx, excluded_mts = self._expand_indices_titles_only(excluded_books)
         if excluded_idx:
             print(f"[exclude] {len(excluded_idx)} indices derived from {len(excluded_books)} excluded_books entries.")
 
-        # Score all items (cosine similarity on normalized vectors)
+        # Score all items
         scores = self.item_embs_norm @ user_vec  # (num_items,)
 
-        # Exclude explicit liked/disliked book indices for raw pool
         mask_exclude_liked_idx = np.zeros_like(scores, dtype=bool)
         if liked_idx:
             mask_exclude_liked_idx[liked_idx] = True
@@ -557,31 +669,23 @@ class DescEmbeddingTeacher:
         if disliked_idx:
             mask_exclude_disliked_idx[disliked_idx] = True
 
-        # Exclude entire title families by main_title *only* for liked/disliked books
         raw_excluded_main_titles = set()
         raw_excluded_main_titles.update(liked_mts)
         raw_excluded_main_titles.update(disliked_mts)
         mask_exclude_main = self.df_books["main_title"].isin(raw_excluded_main_titles).to_numpy(bool)
 
-        # Genre/author masks for filtering step
         mask_disliked_genres = self._build_disliked_genre_mask(disliked_genres)
         mask_disliked_authors = self._build_disliked_author_mask(disliked_authors)
 
-        # Overall hard exclusion for candidate *pool* (no exact liked/disliked families)
-        # NOTE: excluded_books are NOT removed here; they will be removed only in filtered step.
         mask_exclude_raw = (
             mask_exclude_liked_idx
             | mask_exclude_disliked_idx
             | mask_exclude_main
         )
 
-        # Sort all candidates by score descending
         candidate_indices = np.argsort(-scores)
-
-        # Decide how deep to look for candidates to allow replacement after filtering
         pool_size = max(top_raw * 3, top_filtered * 5)
 
-        # Collect candidate pool with de-dup by main_title
         raw_selected: List[int] = []
         seen_main_titles: Set[str] = set()
 
@@ -596,7 +700,6 @@ class DescEmbeddingTeacher:
             seen_main_titles.add(mt)
             raw_selected.append(idx)
 
-        # Precompute exclusion info for filtering step
         mask_excluded_idx = np.zeros_like(scores, dtype=bool)
         if excluded_idx:
             mask_excluded_idx[excluded_idx] = True
@@ -612,24 +715,22 @@ class DescEmbeddingTeacher:
                 "score": float(score_val),
             }
 
-        # RAW list = first top_raw from candidate pool (excluded_books are allowed here)
+        # RAW list (no excluded filter here)
         raw_selected_for_output = raw_selected[:top_raw]
         raw_list: List[Dict[str, Any]] = []
         for idx in raw_selected_for_output:
             row = self.df_books.iloc[idx]
             raw_list.append(row_to_dict(row, scores[idx]))
 
-        # FILTERED list = from the same pool but enforce disliked_genres/authors + excluded_books
+        # FILTERED list (apply genre/author + excluded filters)
         filtered_list: List[Dict[str, Any]] = []
         for idx in raw_selected:
             if len(filtered_list) >= top_filtered:
                 break
 
-            # Exclude genres/authors
             if mask_disliked_genres[idx] or mask_disliked_authors[idx]:
                 continue
 
-            # Exclude explicitly excluded indices & their main_title families
             if mask_excluded_idx[idx]:
                 continue
             mt = self.df_books.iloc[idx]["main_title"]
@@ -638,10 +739,25 @@ class DescEmbeddingTeacher:
 
             row = self.df_books.iloc[idx]
             filtered_list.append(row_to_dict(row, scores[idx]))
+            
+        print("\n================= FILTERED =================")
+        for b in filtered_list:
+            print(
+                f"{b['book_id']:8d} |\n {b['title'][:70]:70s} |\n "
+                f"rating={b['average_rating']:.2f} |\n "
+                f"genres={b['genres']} |\n authors={b['authors']} |\n score={b['score']:.4f} \n -----------"
+            )
+        
+        print("\n================= UNMATCHED =================")
+        for c in unmatched_titles:
+            print(
+                f"{c:} |\n"
+            )
 
         return {
             "raw": raw_list,
             "filtered": filtered_list,
+            "unmatched_titles": unmatched_titles,
         }
 
 
@@ -652,30 +768,23 @@ class DescEmbeddingTeacher:
 def main():
     teacher = DescEmbeddingTeacher()
 
-    # Example "planner" query
     query = {
         "liked_books": [
             {"title": "The Hobbit", "rating": 5.0},
+            {"title": "Some Nonexistent Book", "rating": 4.0},
         ],
         "disliked_books": [],
         "excluded_books": [
             {"title": "A Tolkien Bestiary"},
+            {"title": "Another Missing Title"},
         ],
-        "liked_genres": [],
+        "liked_genres": ["fantasy"],
         "disliked_genres": ["young adult"],
-        "liked_authors": [],
+        "liked_authors": ["Brandon Sanderson"],
         "disliked_authors": ["J.R.R. Tolkien"],
     }
 
     result = teacher.recommend_from_query(query, top_raw=15, top_filtered=20, alpha=1.0)
-
-    print("\n================= RAW (top 15) =================")
-    for b in result["raw"]:
-        print(
-            f"{b['book_id']:8d} |\n {b['title'][:70]:70s} |\n "
-            f"rating={b['average_rating']:.2f} |\n "
-            f"genres={b['genres']} |\n authors={b['authors']} |\n score={b['score']:.4f} \n -----------"
-        )
 
     print("\n================= FILTERED (top 20) =================")
     for b in result["filtered"]:
@@ -684,6 +793,10 @@ def main():
             f"rating={b['average_rating']:.2f} |\n "
             f"genres={b['genres']} |\n authors={b['authors']} |\n score={b['score']:.4f} \n -----------"
         )
+
+    print("\n================= UNMATCHED TITLES =================")
+    for k, v in result["unmatched_titles"].items():
+        print(f"{k}: {v}")
 
     print("\n[done] pseudo_user_teacher sanity test.")
 
