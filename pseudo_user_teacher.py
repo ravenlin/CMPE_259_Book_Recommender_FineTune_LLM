@@ -129,9 +129,9 @@ def load_authors_mapping() -> Dict[int, str]:
         print(f"[warn] {AUTHORS_PATH} not found; author filters will only use raw 'authors' text.")
         return {}
 
-    print(f"[load] Loading authors from {AUTHORS_PATH}")
+    #print(f"[load] Loading authors from {AUTHORS_PATH}")
     df_auth = pd.read_parquet(AUTHORS_PATH)
-    print("[info] authors shape:", df_auth.shape)
+    #print("[info] authors shape:", df_auth.shape)
 
     cols = list(df_auth.columns)
     id_col = next((c for c in ["author_id", "id"] if c in cols), None)
@@ -149,7 +149,7 @@ def load_authors_mapping() -> Dict[int, str]:
     df_auth[name_col] = df_auth[name_col].astype(str)
 
     mapping = dict(zip(df_auth[id_col].tolist(), df_auth[name_col].tolist()))
-    print(f"[info] built author_id→name mapping of size {len(mapping)}")
+    #print(f"[info] built author_id→name mapping of size {len(mapping)}")
     return mapping
 
 
@@ -159,14 +159,14 @@ def load_authors_mapping() -> Dict[int, str]:
 
 class DescEmbeddingTeacher:
     def __init__(self):
-        print("[load] Loading books_with_genres...")
+        #print("[load] Loading books_with_genres...")
         self.df_books = pd.read_parquet(BOOKS_PATH)
         self.df_books["book_id"] = self.df_books["book_id"].astype(int)
-        print("[info] books shape:", self.df_books.shape)
+        #print("[info] books shape:", self.df_books.shape)
 
-        print(f"[load] Loading description embeddings from {DESC_EMB_PATH}")
+        #print(f"[load] Loading description embeddings from {DESC_EMB_PATH}")
         self.item_embs = np.load(DESC_EMB_PATH)
-        print("[info] item_embs shape:", self.item_embs.shape)
+        #print("[info] item_embs shape:", self.item_embs.shape)
 
         if self.item_embs.shape[0] != len(self.df_books):
             raise ValueError(
@@ -246,7 +246,7 @@ class DescEmbeddingTeacher:
 
             self.df_books["author_names"] = self.df_books["authors_parsed"].apply(ids_to_names)
             total_names = int(self.df_books["author_names"].apply(len).sum())
-            print(f"[authors] author_names filled from authors.parquet, total names={total_names}")
+            #print(f"[authors] author_names filled from authors.parquet, total names={total_names}")
         else:
             self.df_books["author_names"] = [[] for _ in range(len(self.df_books))]
 
@@ -273,7 +273,7 @@ class DescEmbeddingTeacher:
 
             self.df_books["author_names"] = self.df_books["authors"].apply(authors_text_to_names)
             total_names = int(self.df_books["author_names"].apply(len).sum())
-            print(f"[authors] filled author_names from books['authors'] text, total names={total_names}")
+            #print(f"[authors] filled author_names from books['authors'] text, total names={total_names}")
 
         # ---- Precompute genre -> indices and author_name -> indices for liked_genres/authors embedding ----
         self.genre_to_indices: Dict[str, List[int]] = {}
