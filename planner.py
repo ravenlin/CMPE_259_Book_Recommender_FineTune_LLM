@@ -49,7 +49,7 @@ import requests  # pip install requests
 # -----------------------------
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "llama2"
+OLLAMA_MODEL = "phi3:3.8b "
 
 # -----------------------------
 # Normalization helpers
@@ -334,7 +334,9 @@ What books does the user want to EXCLUDE from future recommendations?
 Rules:
 - These are books the user explicitly does NOT want recommended again,
   e.g., "don't recommend this again", "no more of that one",
-  "I've read this already, don't show it again".
+  "I've read this already, don't show it again". 
+- If the user states, "I dislike" or any other sentiment of dislike, they should not be included in the 
+  exclusions.
 - Exclusions may refer either to titles in previous_preferences or titles
   in the numbered recommendation list shown in current_user_message.
 - If previous_preferences is provided, include existing excluded_books
