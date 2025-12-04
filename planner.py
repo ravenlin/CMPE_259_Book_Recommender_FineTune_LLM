@@ -49,7 +49,7 @@ import requests  # pip install requests
 # -----------------------------
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "phi3:3.8b "
+OLLAMA_MODEL = "mistral"
 
 # -----------------------------
 # Normalization helpers
@@ -248,7 +248,7 @@ def _call_field_extractor(field_prompt: str, context_obj: Dict[str, Any]) -> Any
         "options": {"temperature": 0.0},
     }
 
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=600)
     resp.raise_for_status()
     data = resp.json()
     content = data["message"]["content"]
@@ -844,10 +844,6 @@ def call_ollama_planner(
     # Deterministic self-check: drop anything that doesn't literally appear
     # in the allowed context.
     prefs_filtered = _filter_prefs_against_context(prefs_raw, context)
-    
-    print("------- Final JSON ------")
-    for item in prefs_filtered:
-        print(f"{item} : {prefs_filtered[item]}")
 
     # Merge with previous preferences so we don't "forget" earlier info.
     if prev_norm is not None:

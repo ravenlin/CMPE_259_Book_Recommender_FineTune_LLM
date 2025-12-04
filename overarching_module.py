@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from planner import call_ollama_planner  # :contentReference[oaicite:3]{index=3}
 from pseudo_user_teacher import DescEmbeddingTeacher  # :contentReference[oaicite:4]{index=4}
+import json
 
 
 def _format_recs_for_planner(recs: List[Dict[str, Any]]) -> str:
@@ -199,6 +200,10 @@ class BookRecSession:
             previous_preferences=self.previous_preferences,
         )
         self.previous_preferences = prefs
+        
+        print("=== FINAL FOLLOW-UP PREFS ===")
+        print(json.dumps(prefs, indent=2))
+        print()
 
         num_recs = int(prefs.get("num_recommendations", 10))
         if num_recs < 1:
