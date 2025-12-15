@@ -277,8 +277,6 @@ Rules:
      SOME_BOOK_TITLE |
      -----------
   The user may say "I liked #2 and #4" to refer to those items by index.
-- If previous_preferences is provided, include any existing liked_books
-  unless the user clearly contradicts them.
 - Do NOT add any book that does NOT appear either in:
     - current_user_message, OR
     - previous_preferences.*books lists.
@@ -309,8 +307,6 @@ Rules:
      SOME_BOOK_TITLE |
      -----------
   The user may reference items by index (e.g., "#1", "#3").
-- If previous_preferences is provided, include existing disliked_books
-  unless the user clearly changes their mind.
 - Do NOT add any book that does NOT appear either in:
     - current_user_message, OR
     - previous_preferences.*books lists.
@@ -335,12 +331,9 @@ Rules:
 - These are books the user explicitly does NOT want recommended again,
   e.g., "don't recommend this again", "no more of that one",
   "I've read this already, don't show it again". 
-- If the user states, "I dislike" or any other sentiment of dislike, they should not be included in the 
-  exclusions.
+- If the user states, "I dislike" or any other sentiment of dislike, they should not be included in your response.
 - Exclusions may refer either to titles in previous_preferences or titles
   in the numbered recommendation list shown in current_user_message.
-- If previous_preferences is provided, include existing excluded_books
-  unless the user clearly changes that preference.
 - Do NOT automatically exclude liked or disliked books unless the user
   explicitly indicates they should be excluded from future suggestions.
 - Do NOT add any book that does NOT appear either in:
@@ -611,6 +604,42 @@ def _filter_prefs_against_context(
         "num_recommendations": prefs_raw.get("num_recommendations", 10),
     }
 
+def _fix_excluded_vs_disliked(prefs: dict, user_message: str) -> dict:
+    """
+    Prevent accidental exclusions:
+    - If a title is in disliked_books, it can only be in excluded_books if the user
+      explicitly requested exclusion (e.g., "exclude", "don't recommend", "no more", "remove").
+    """
+    msg = (user_message or "").lower()
+    explicit_exclude = any(k in msg for k in [
+        "exclude", "don't recommend", "do not recommend", "no more", "remove", "never show", "stop recommending"
+    ])
+
+    disliked_titles = {b["title"].strip().lower() for b in prefs.get("disliked_books", []) if isinstance(b, dict) and b.get("title")}
+    new_excl = []
+    for b in prefs.get("excluded_books", []):
+        t = str(b.get("title", "")).strip()
+        if not t:
+            continue
+        if t.lower() in disliked_titles and not explicit_exclude:
+            # keep it disliked, but do not auto-exclude it
+            continue
+        new_excl.append(b)
+
+    prefs["excluded_books"] = new_excl
+    return prefs
+
+def _clean_author_lists(prefs: dict) -> dict:
+    bad = set()
+    # remove author entries that match any book title we already track
+    for bl in ["liked_books", "disliked_books", "excluded_books"]:
+        for b in prefs.get(bl, []):
+            if isinstance(b, dict) and b.get("title"):
+                bad.add(b["title"].strip().lower())
+
+    prefs["liked_authors"] = [a for a in prefs.get("liked_authors", []) if str(a).strip().lower() not in bad]
+    prefs["disliked_authors"] = [a for a in prefs.get("disliked_authors", []) if str(a).strip().lower() not in bad]
+    return prefs
 
 # -----------------------------
 # Merge with previous preferences
@@ -658,11 +687,12 @@ def _merge_with_previous(
             del excluded[title]
 
     # 2) Titles newly excluded: remove from liked/disliked.
-    for title in list(excluded.keys()):
-        if title in liked:
-            del liked[title]
-        if title in disliked:
-            del disliked[title]
+    # Commenting out to ensure liked and disliked books still factor into embedding calcs even though not shown
+    # for title in list(excluded.keys()):
+    #     if title in liked:
+    #         del liked[title]
+    #     if title in disliked:
+    #         del disliked[title]
 
     # 3) Titles newly disliked: remove from liked.
     for title in list(disliked.keys()):
@@ -844,6 +874,7 @@ def call_ollama_planner(
     # Deterministic self-check: drop anything that doesn't literally appear
     # in the allowed context.
     prefs_filtered = _filter_prefs_against_context(prefs_raw, context)
+    #prefs_filtered = _fix_excluded_vs_disliked(prefs_filtered, user_message)
 
     # Merge with previous preferences so we don't "forget" earlier info.
     if prev_norm is not None:
@@ -853,7 +884,9 @@ def call_ollama_planner(
 
     # Final normalization into the schema used by the rest of the system.
     
+    #prefs_merged = _clean_author_lists(prefs_merged)
     final = _normalize_preferences(prefs_merged)
+
     return final
 
 
