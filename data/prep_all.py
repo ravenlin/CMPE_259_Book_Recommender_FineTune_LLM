@@ -46,7 +46,7 @@ def main():
         "Enrich books_with_genres.parquet",
     )
 
-    print("\n🎉 All data prep steps completed. You should now have:")
+    print("\n All data prep steps completed. You should now have:")
     print("  - data/processed/books.parquet (or similar)")
     print("  - data/processed/interactions.parquet")
     print("  - data/processed/authors.parquet")

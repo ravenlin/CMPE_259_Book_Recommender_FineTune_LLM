@@ -12,6 +12,13 @@
 #   - books_with_genres.parquet has columns: book_id, title, maybe authors / authors_text / author /
 #     description, etc.
 #   - If authors.parquet exists, it maps author_id -> author_name and we use that to resolve IDs.
+#
+# Notebook-friendly API:
+#   from build_desc_embeddings import build_description_embeddings
+#   build_description_embeddings(limit_books=50_000)  # demo mode
+#
+#   or from CLI:
+#   python build_desc_embeddings.py
 
 from __future__ import annotations
 
@@ -22,8 +29,6 @@ from pathlib import Path
 import ast
 import numpy as np
 import pandas as pd
-
-
 
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
@@ -227,14 +232,32 @@ def build_text_corpus(df: pd.DataFrame) -> list[str]:
 
 
 # -----------------------------
-# Main
+# Core API
 # -----------------------------
 
-def main():
+def build_description_embeddings(limit_books: int | None = None) -> np.ndarray:
+    """
+    Build description embeddings for books_with_genres.parquet and save to EMB_PATH.
+
+    Parameters
+    ----------
+    limit_books : int | None
+        If not None, only the first `limit_books` rows are encoded.
+        This is useful for "demo mode" in a notebook or low-RAM machines.
+
+    Returns
+    -------
+    np.ndarray
+        The embeddings array of shape [num_books, dim].
+    """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1) Load books and authors mapping
     df_books = load_books()
+    if limit_books is not None:
+        df_books = df_books.head(limit_books).copy()
+        print(f"[info] limiting to first {len(df_books)} books for embedding.")
+
     author_map = load_authors_mapping()
     df_books = attach_author_names(df_books, author_map)
 
@@ -264,6 +287,17 @@ def main():
 
     np.save(EMB_PATH, desc_embeddings)
     print(f"[done] Saved description embeddings to {EMB_PATH}")
+
+    return desc_embeddings
+
+
+# -----------------------------
+# CLI entrypoint
+# -----------------------------
+
+def main():
+    # CLI: build full embeddings with no limit
+    build_description_embeddings(limit_books=None)
 
 
 if __name__ == "__main__":
